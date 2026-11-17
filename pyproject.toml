@@ -1,0 +1,16 @@
+[project]
+name = "glass-lagrangian"
+version = "0.1.0"
+description = "Spectral embedding of oxide-glass compositions and a linked-panel explorer to propose new glasses"
+requires-python = ">=3.12"
+dependencies = [
+    "dash>=4.5.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.5",
+    "pandas>=3.1.1",
+    "plotly>=7.1.0",
+    "pyarrow>=26.0.1",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "tqdm>=4.70.1",
+]
