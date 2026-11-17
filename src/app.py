@@ -30,8 +30,8 @@ Generate candidates (button)
 "Zoom to selection" fits every panel to the real glasses left by the selection (8% margin); "Reset zoom" undoes it.
 
 Query compositions: type compositions, one per line ("TeO2 75 PbO 25", "75TeO2-25PbO", "teo2=75, pbo=25");
-they are marked with a red dot in every panel (everything else turns faint), with their status and RI.
-"Clear" removes them and restores the normal view.
+they are marked with a red dot in every panel, with their status and RI.
+"Clear" removes them.
 
 
 Run from the project root (needs outputs of spectral_embedding.py and train_ri_model.py):
@@ -71,9 +71,6 @@ REAL_TRACE, GEN_TRACE, QUERY_TRACE = range(3)  # trace order in each panel
 N_TRACES = 3
 NEW_CHEM = ["new system", "outside range"]
 QUERY_COLOR = "#d62728"
-FOCUS_FAINT = 0.03  # opacity of everything else while typed compositions are in focus
-# normal opacities (marker, selected, unselected), restored on "Clear"
-FOCUS_OPACITY = {REAL_TRACE: (1.0, 1.0, UNSEL_OPACITY), GEN_TRACE: (1.0, 1.0, 1.0)}
 
 
 def oxide_formula(name: str) -> str:
@@ -291,16 +288,6 @@ def make_grid(K: Context) -> go.Figure:
     return fig
 
 
-def focus_patch(patch: Patch, on: bool):
-    """Focus on the typed compositions: make everything else faint (on) or restore normal opacity (off)."""
-    for n in range(len(PAIRS)):
-        for which, (marker, selected, unselected) in FOCUS_OPACITY.items():
-            t = patch["data"][trace_index(n, which)]
-            t["marker"]["opacity"] = FOCUS_FAINT if on else marker
-            t["selected"]["marker"]["opacity"] = FOCUS_FAINT if on else selected
-            t["unselected"]["marker"]["opacity"] = FOCUS_FAINT if on else unselected
-
-
 def marker_patch(patch: Patch, which: int, Z: np.ndarray, hover: list[str], text=None, color=None):
     for n, (i, j) in enumerate(PAIRS):
         t = patch["data"][trace_index(n, which)]
@@ -489,6 +476,7 @@ def build_app(K: Context) -> Dash:
                 lo, hi = K.R[sel, k - 1].min(), K.R[sel, k - 1].max()
                 pad = 0.08 * (hi - lo) if hi > lo else 0.1
                 patch["layout"][ax]["range"] = [float(lo - pad), float(hi + pad)]
+                patch["layout"][ax]["autorange"] = False  # "Reset zoom" sets autorange=True, which would override range
         return patch
 
     # ---- generate candidates for the current selection
@@ -541,7 +529,6 @@ def build_app(K: Context) -> Dash:
         lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
         if ctx.triggered_id == "query-clear" or not lines:
             marker_patch(patch, QUERY_TRACE, np.zeros((0, N_PHI)), [], [])
-            focus_patch(patch, on=False)
             return patch, [], ""
         comps, errors = [], []
         for k, ln in enumerate(lines, start=1):
@@ -558,7 +545,6 @@ def build_app(K: Context) -> Dash:
         hover = [f"#{lab} · {c} · RI≈{r:.3f} · {s}"
                  for lab, c, r, s in zip(info["label"], info["composition"], info["ri_interp"], info["status"])]
         marker_patch(patch, QUERY_TRACE, Z, hover, info["label"].tolist())
-        focus_patch(patch, on=True)
         return patch, info[[c for c, _ in QUERY_COLS]].round(ROUND).to_dict("records"), ""
 
     @app.callback(Output("grid", "figure", allow_duplicate=True),

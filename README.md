@@ -149,9 +149,9 @@ series at 2.3–2.65); they are kept, on the assumption that they average out.
    chemistry** keeps *new system* and *outside range*.
 4. **Export CSV** writes the candidates with their full mol% compositions to `outputs/data/candidates_*.csv`.
 5. **Show compositions:** paste compositions, one per line (`SiO2 70 Na2O 15 CaO 15`, `75TeO2-25PbO`, …).
-   - Each is plotted as a red dot in every panel, with everything else made faint.
+   - Each is plotted as a red dot in every panel.
    - The composition table shows the same columns for them.
-   - **Clear** restores the normal view.
+   - **Clear** removes them.
 
 All panels are subplots of one figure. Ten separate WebGL figures exceed the browser's WebGL context limit, and the
 oldest panels go blank.
