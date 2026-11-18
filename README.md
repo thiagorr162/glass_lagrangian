@@ -13,6 +13,7 @@ glasses that fill those holes.
 | 3 | `src/train_ri_model.py` | Trains a refractive-index regressor (gradient boosting on composition) and reports 5-fold CV error. | ~30 s |
 | 4 | `src/compare_ri_interpolation.py` | Compares the regressor with interpolating RI from neighboring glasses. | ~2 min |
 | 5 | `src/app.py` | Dash explorer: select a region, generate candidates, inspect, export. | ~5 s to start |
+| — | `src/families_vs_eigenfunctions.py` | Tests how well the eigenfunctions separate glass families (dominant network former). | ~1 min |
 | — | `src/holes.py` | Hole scores (emptiness, enclosure), used by the app; as a script, prints reference distributions. | ~10 s |
 | — | `src/check_candidates.py` | Compares candidates with the database (system, known range, families), used by the app; as a script, checks an exported CSV. | ~3 s |
 | — | `src/mixture_cloud.py` | Earlier approach: 300k mixtures precomputed over the whole map. Not used by the app anymore. | ~2 min |
@@ -73,6 +74,21 @@ fractions.
 **Why not a kNN graph with local bandwidths?** A first attempt used self-tuning σ_i, the distance to the 7th
 neighbor. In dense series of near-identical compositions σ_i → 0, edge weights underflowed (min ≈ 1e-199) and the
 eigenvectors localized on clusters of 9–24 points.
+
+### What the eigenfunctions mean
+
+Labelling every glass by its dominant network former (`families_vs_eigenfunctions.py`), the eigenfunctions turn
+out to be contrasts between families, as expected from spectral clustering:
+
+| | low end (2% extremes) | high end | strongest correlation |
+|---|---|---|---|
+| φ₁ | borate | silicate | SiO₂ (ρ = 0.92) |
+| φ₂ | borate | phosphate | B₂O₃ (−0.76), P₂O₅ (0.60) |
+| φ₃ | phosphate | tellurite | P₂O₅ (−0.53) |
+| φ₄ | tellurite | germanate | GeO₂ (0.38) |
+
+The family (silicate, borate, phosphate, germanate, tellurite, or non-conventional if formers < 20 mol%) is
+recovered from φ₁…φ₅ alone with 99.0% 5-fold kNN accuracy (95.4% from φ₁, φ₂; majority baseline 45.6%).
 
 ### Nyström extension
 
