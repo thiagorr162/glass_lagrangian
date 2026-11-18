@@ -125,6 +125,9 @@ series at 2.3–2.65); they are kept, on the assumption that they average out.
    - Selections in different panels combine by **intersection**.
    - The × chips remove one selection; **Clear selections** removes all.
    - **Zoom to selection** fits every panel to the glasses left by the selection; **Reset zoom** undoes it.
+   - **color by** colors the real glasses by RI, by the total of network formers or intermediates (mol%), or by
+     each network former alone (SiO₂, P₂O₅, B₂O₃, GeO₂, TeO₂). Formers: SiO₂ P₂O₅ B₂O₃ GeO₂ TeO₂. Intermediates:
+     ZrO₂ Al₂O₃ Ta₂O₅ La₂O₃ Ga₂O₃ TiO₂ Nb₂O₅ PbO WO₃ Sb₂O₃ Bi₂O₃ As₂O₃ MoO₃ V₂O₅ As₂O₅ VO₆ V₂O₃ Nb₂O₃ Ta₂O₃.
 2. Click **Generate candidates**. In ~9 s for 20k mixtures:
    - **Parents:** the real glasses inside the selection.
    - **Mixtures:** convex mixtures, so always valid compositions summing to 100. They are a parent plus 1 or 2 of
@@ -142,7 +145,7 @@ series at 2.3–2.65); they are kept, on the assumption that they average out.
      the measured range of its system by > 1 mol%) or *known range*.
    - **d_nn (mol%):** distance to the nearest real glass in composition. About 2–6 mol% is the useful range.
      Below that, the glass practically exists; above, it is extrapolation.
-   - **RI interp, RI hgb, nearest real glass, parents.**
+   - **RI interp, RI hgb, formers and intermediates (mol%), nearest real glass, parents.**
    - **composition:** the full composition, normalized to 100 and paste-ready.
 
    **Only interior holes** (default on) keeps candidates with emptiness ≥ 2 and enclosure ≥ 0.4. **Only new

@@ -27,6 +27,9 @@ Generate candidates (button)
   (click the cell, Ctrl+C, paste). "Export CSV" writes all of them.
 
 "show candidates" hides/shows the generated candidates on the panels.
+"color by" colors the real glasses by RI, by each network former alone (mol%), by network formers (SiO2 P2O5 B2O3 GeO2 TeO2, mol%) or by
+intermediates (ZrO2 Al2O3 Ta2O5 La2O3 Ga2O3 TiO2 Nb2O5 PbO WO3 Sb2O3 Bi2O3 As2O3 MoO3 V2O5 ..., mol%); both sums are
+also shown on hover and as table columns.
 "Zoom to selection" fits every panel to the real glasses left by the selection (8% margin); "Reset zoom" undoes it.
 
 Query compositions: type compositions, one per line ("TeO2 75 PbO 25", "75TeO2-25PbO", "teo2=75, pbo=25");
@@ -71,6 +74,12 @@ REAL_TRACE, GEN_TRACE, QUERY_TRACE = range(3)  # trace order in each panel
 N_TRACES = 3
 NEW_CHEM = ["new system", "outside range"]
 QUERY_COLOR = "#d62728"
+# oxide roles used to color the map and summarize compositions
+NETWORK_FORMERS = ["SiO2", "P2O5", "B2O3", "GeO2", "TeO2"]
+INTERMEDIATES = ["ZrO2", "Al2O3", "Ta2O5", "La2O3", "Ga2O3", "TiO2", "Nb2O5", "PbO", "WO3", "Sb2O3", "Bi2O3", "As2O3",
+                 "MoO3", "V2O5", "As2O5", "VO6", "V2O3", "Nb2O3", "Ta2O3"]
+COLOR_BY = {"ri": "RI", "formers": "network formers, total (mol%)", "intermediates": "intermediates, total (mol%)",
+            **{f"ox:{o.lower()}": f"{o} (mol%)" for o in NETWORK_FORMERS}}  # plus each network former alone
 
 
 def oxide_formula(name: str) -> str:
@@ -115,6 +124,11 @@ class Context:
         model_path = MODELS / "ri_model.joblib"
         self.ri_model = joblib.load(model_path) if model_path.exists() else None
         self.systems = SystemIndex(100 * self.X, self.oxides)
+        idx = {o: k for k, o in enumerate(self.oxides)}
+        self.former_idx = [idx[o.lower()] for o in NETWORK_FORMERS if o.lower() in idx]
+        self.inter_idx = [idx[o.lower()] for o in INTERMEDIATES if o.lower() in idx]
+        self.formers = 100 * self.X[:, self.former_idx].sum(axis=1)
+        self.intermediates = 100 * self.X[:, self.inter_idx].sum(axis=1)
 
 
     def embed(self, C: np.ndarray) -> np.ndarray:
@@ -131,6 +145,9 @@ class Context:
         out["ri_hgb"] = self.ri_model.predict(C) if self.ri_model is not None else np.nan
         out["ri_flag"] = (out["ri_interp"] - out["ri_hgb"]).abs() > self.args.ri_disagree
         out["composition"] = full_compositions(100 * C, self.oxides)
+        tot = C.sum(axis=1)
+        out["formers"] = 100 * C[:, self.former_idx].sum(axis=1) / tot
+        out["intermediates"] = 100 * C[:, self.inter_idx].sum(axis=1) / tot
         return out
 
     def generate(self, store: dict, n: int, seed: int = 0):
@@ -270,9 +287,12 @@ def make_grid(K: Context) -> go.Figure:
             x=R[:, i - 1], y=R[:, j - 1], mode="markers", name="real",
             marker=dict(size=3, color=np.clip(ri, cmin, cmax), colorscale="Viridis", cmin=cmin, cmax=cmax,
                         showscale=(n == 0), colorbar=dict(title="RI", len=0.5, y=1, yanchor="top", thickness=10)),
+            # color is switched by the "color by" selector (RI / network formers / intermediates)
             selected=dict(marker=dict(opacity=1)),
             unselected=dict(marker=dict(color=UNSEL_COLOR, opacity=UNSEL_OPACITY)),
-            customdata=ri, hovertemplate="real · RI=%{customdata:.4f}<extra></extra>"), **kw)
+            customdata=np.c_[ri, K.formers, K.intermediates].astype(np.float32),
+            hovertemplate="real · RI=%{customdata[0]:.4f} · formers %{customdata[1]:.1f}% · "
+                          "intermediates %{customdata[2]:.1f}%<extra></extra>"), **kw)
         fig.add_trace(go.Scattergl(x=[], y=[], mode="markers", name="generated",
                                    marker=dict(size=4, symbol="diamond"),
                                    unselected=dict(marker=dict(opacity=1)),
@@ -327,15 +347,18 @@ def parse_composition(line: str, oxides: np.ndarray) -> np.ndarray:
 TABLE_COLS = [("rank", "#"), ("n", "n similar"), ("emptiness", "emptiness"), ("enclosure", "enclosure"),
               ("status", "status"), ("system", "system"), ("n_same_system", "DB glasses in system"),
               ("max_out", "mol% outside known range"), ("ri_interp", "RI interp"), ("ri_hgb", "RI hgb"),
-              ("ri_flag", "RI disagree"), ("d_nn_pct", "d_nn (mol%)"),
+              ("ri_flag", "RI disagree"), ("d_nn_pct", "d_nn (mol%)"), ("formers", "formers (mol%)"),
+              ("intermediates", "intermediates (mol%)"),
               ("composition", "composition (mol%, full, copy-ready)"), ("nn1", "nearest real glass"),
               ("type", "type"), ("parents", "parents (weight·ID)")]
 QUERY_COLS = [("label", "#"), ("composition", "composition (mol%, normalized)"), ("emptiness", "emptiness"),
               ("enclosure", "enclosure"), ("status", "status"), ("system", "system"),
               ("n_same_system", "DB glasses in system"), ("max_out", "mol% outside known range"),
               ("ri_interp", "RI interp"), ("ri_hgb", "RI hgb"), ("ri_flag", "RI disagree"),
-              ("d_nn_pct", "d_nn (mol%)"), ("nn1", "nearest real glass")]
-ROUND = {"ri_interp": 4, "ri_hgb": 4, "d_nn_pct": 2, "max_out": 2, "emptiness": 2, "enclosure": 2}
+              ("d_nn_pct", "d_nn (mol%)"), ("formers", "formers (mol%)"), ("intermediates", "intermediates (mol%)"),
+              ("nn1", "nearest real glass")]
+ROUND = {"ri_interp": 4, "ri_hgb": 4, "d_nn_pct": 2, "max_out": 2, "emptiness": 2, "enclosure": 2,
+         "formers": 1, "intermediates": 1}
 CELL = {"fontSize": "12px", "textAlign": "left", "padding": "3px 6px", "whiteSpace": "normal", "maxWidth": "380px"}
 FLAG_STYLE = [{"if": {"filter_query": "{ri_flag} = true"}, "backgroundColor": "#fff3cd"}]
 HOLE_EMPTINESS, HOLE_ENCLOSURE = 2.0, 0.4  # interior hole: emptier than ~98% of real glasses, and surrounded
@@ -370,6 +393,11 @@ def build_app(K: Context) -> Dash:
             html.Span(["mixtures: ", dcc.Input(id="gen-n", type="number", value=args.gen_n, min=1000, step=1000,
                                                style={"width": "80px"})], style={"fontSize": "13px"}),
             html.Button("Export CSV", id="export"),
+            html.Span(["color by: ", dcc.Dropdown(id="color-by", value="ri", clearable=False, searchable=False,
+                                                  options=[{"label": v, "value": k} for k, v in COLOR_BY.items()],
+                                                  style={"width": "260px", "display": "inline-block",
+                                                         "verticalAlign": "middle"})],
+                      style={"fontSize": "13px"}),
             dcc.Checklist(id="show-gen", options=[{"label": " show candidates", "value": "on"}],
                           value=["on"], inline=True),
             html.Span(id="export-msg", style={"color": "#555"}),
@@ -456,6 +484,24 @@ def build_app(K: Context) -> Dash:
         summary = html.Div([html.B(f"Intersection of {len(store)} selection(s): {int(r_in.sum())} real glasses"),
                             f" · {ri_txt}"])
         return patch, store, summary, bar
+
+    # ---- color the real glasses by RI / network formers / intermediates
+    @app.callback(Output("grid", "figure", allow_duplicate=True), Input("color-by", "value"),
+                  prevent_initial_call=True)
+    def on_color_by(key):
+        if key.startswith("ox:"):  # a single oxide, mol%
+            values = 100 * K.X[:, list(K.oxides).index(key[3:])]
+        else:
+            values = {"ri": K.ri, "formers": K.formers, "intermediates": K.intermediates}[key]
+        lo, hi = (np.percentile(values, [1, 99]) if key == "ri" else (0.0, float(values.max())))
+        colors = np.round(np.clip(values, lo, hi), 3).tolist()  # rounded: smaller payload (58k values x 10 panels)
+        patch = Patch()
+        for n in range(len(PAIRS)):
+            m = patch["data"][trace_index(n, REAL_TRACE)]["marker"]
+            m["color"] = colors
+            m["cmin"], m["cmax"] = float(lo), float(hi)
+        patch["data"][trace_index(0, REAL_TRACE)]["marker"]["colorbar"]["title"]["text"] = COLOR_BY[key]
+        return patch
 
     # ---- zoom every panel to the glasses left by the selection
     @app.callback(Output("grid", "figure", allow_duplicate=True),
