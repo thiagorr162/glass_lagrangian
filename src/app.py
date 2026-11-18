@@ -277,7 +277,8 @@ def make_grid(K: Context) -> go.Figure:
                                    marker=dict(size=4, symbol="diamond"),
                                    unselected=dict(marker=dict(opacity=1)),
                                    hovertemplate="%{hovertext}<extra></extra>"), **kw)
-        fig.add_trace(go.Scatter(x=[], y=[], mode="markers+text", name="query", textposition="top right",
+        # WebGL like the other traces: SVG traces are drawn UNDER the WebGL canvas. Last trace = on top.
+        fig.add_trace(go.Scattergl(x=[], y=[], mode="markers+text", name="query", textposition="top right",
                                  textfont=dict(color=QUERY_COLOR, size=14),
                                  marker=dict(symbol="circle", size=13, color=QUERY_COLOR, line=dict(width=1.5, color="white")),
                                  unselected=dict(marker=dict(opacity=1)),
