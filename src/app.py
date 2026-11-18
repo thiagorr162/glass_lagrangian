@@ -38,8 +38,9 @@ they are marked with a red dot in every panel, with their status and RI.
 
 
 Run from the project root (needs outputs of spectral_embedding.py and train_ri_model.py):
-  uv run src/app.py
-then open http://127.0.0.1:8050
+  uv run src/app.py                          # composition-only map (spectral_embedding.py)
+  uv run src/app.py --tag m10000_s1_ri1      # RI-weighted map (spectral_embedding_ri.py)
+then open http://127.0.0.1:8050. For a 3D view (three eigenfunctions at once) see src/app_3d.py.
 """
 
 import argparse
@@ -62,7 +63,8 @@ from sklearn.neighbors import KNeighborsRegressor, NearestNeighbors
 sys.path.insert(0, str(Path("src")))
 from check_candidates import STATUSES, SystemIndex, families  # noqa: E402
 from holes import HoleScorer  # noqa: E402
-from spectral_embedding import DATA, DATA_OUT, MODELS, SpectralEmbedding, ensure_dirs  # noqa: E402
+from spectral_embedding import DATA, DATA_OUT, MODELS, ensure_dirs  # noqa: E402
+from spectral_embedding_ri import RISpectralEmbedding, load_model  # noqa: E402
 from train_ri_model import RI_RANGE  # noqa: E402
 
 N_PHI = 5
@@ -115,7 +117,9 @@ class Context:
         self.R = (real[PHIS].to_numpy() - self.mu) / self.sd
         self.holes = HoleScorer(self.R, k=30)
 
-        self.se = SpectralEmbedding.load(MODELS / f"model_{args.tag}.npz")
+        self.se = load_model(MODELS / f"model_{args.tag}.npz")  # plain, or RI-weighted (spectral_embedding_ri.py)
+        self.ri_weighted = isinstance(self.se, RISpectralEmbedding)
+        print(f"model {args.tag}: {'RI-weighted' if self.ri_weighted else 'composition-only'} kernel")
         print("composition neighbors of real glasses ...")
         self.nn_db = NearestNeighbors(n_neighbors=11).fit(self.X)
         self.nbrs = self.nn_db.kneighbors(self.X, return_distance=False)[:, 1:]
@@ -132,7 +136,13 @@ class Context:
 
 
     def embed(self, C: np.ndarray) -> np.ndarray:
-        return (self.se.transform(C)[:, :N_PHI] - self.mu) / self.sd
+        if len(C) == 0:
+            return np.zeros((0, N_PHI))
+        if self.ri_weighted:  # the RI kernel needs RI(C): new compositions get the kNN estimate ("RI interp")
+            phi = self.se.transform(C, ri_new=self.ri_knn.predict(C))
+        else:
+            phi = self.se.transform(C)
+        return (phi[:, :N_PHI] - self.mu) / self.sd
 
     def describe(self, C: np.ndarray, Z: np.ndarray) -> pd.DataFrame:
         """Composition fractions C and their map coordinates Z -> everything shown in the tables."""
@@ -150,13 +160,9 @@ class Context:
         out["intermediates"] = 100 * C[:, self.inter_idx].sum(axis=1) / tot
         return out
 
-    def generate(self, store: dict, n: int, seed: int = 0):
-        """Candidates for the selected region (see module docstring). Returns (DataFrame, C, Z, info)."""
-        rng = np.random.default_rng(seed)
-        pool = np.flatnonzero(points_inside(store, self.R))  # parents: the real glasses of the selected region
-        if len(pool) < 2:
-            return None, None, None, f"only {len(pool)} real glasses in the selection — select a region with glasses", None
-
+    def mixtures(self, pool: np.ndarray, n: int, rng: np.random.Generator):
+        """n convex mixtures around the parents `pool` (see module docstring), keeping those within --dnn-max of a
+        real glass. Returns C (fractions) and, per mixture, its parents i, p2, p3 (-1 = none) and weights W."""
         k = self.nbrs.shape[1]
         m = n // 3
         i = rng.choice(pool, size=n)
@@ -174,25 +180,36 @@ class Context:
 
         d_nn = self.nn_db.kneighbors(C, n_neighbors=1)[0][:, 0]
         plausible = d_nn <= self.args.dnn_max
-        C, i, p2, p3, W, d_nn = C[plausible], i[plausible], p2[plausible], p3[plausible], W[plausible], d_nn[plausible]
+        return C[plausible], i[plausible], p2[plausible], p3[plausible], W[plausible]
+
+    def candidates(self, pool, C, Z, i, p2, p3, W) -> pd.DataFrame:
+        """Table rows for the kept mixtures: describe() plus type, parents and family."""
+        gen = self.describe(C, Z)
+        gen["type"] = np.where(p3 >= 0, "triplet", np.where(np.isin(p2, pool), "pair (region)", "pair"))
+        gen["parents"] = [" + ".join(f"{w:.2f}·{self.ids[q]}" for q, w in zip(qs, ws) if q >= 0)
+                          for qs, ws in zip(np.c_[i, p2, p3], W)]
+        gen["family"] = families(100 * C, -gen["emptiness"].to_numpy(), self.args.family_radius)
+        return gen
+
+    def generate(self, store: dict, n: int, seed: int = 0):
+        """Candidates for the selected region (see module docstring). Returns (DataFrame, C, Z, info)."""
+        rng = np.random.default_rng(seed)
+        pool = np.flatnonzero(points_inside(store, self.R))  # parents: the real glasses of the selected region
+        if len(pool) < 2:
+            return None, None, None, f"only {len(pool)} real glasses in the selection — select a region with glasses", None
+        C, i, p2, p3, W = self.mixtures(pool, n, rng)
         Z = self.embed(C)
         # the region is the intersection of the selections, made concrete as the convex hull of the selected
         # glasses in each panel that has a lasso (tighter than the lasso itself; keeps the holes inside)
         region = hull_region(self.R[pool], store.keys())
         keep = points_inside(store, Z) & points_inside(region, Z)
         info = (f"{len(pool)} parent glasses in the selection · {n} mixtures generated · "
-                f"{int(plausible.sum())} plausible (d_nn ≤ {100 * self.args.dnn_max:.1f} mol%) · "
+                f"{len(C)} plausible (d_nn ≤ {100 * self.args.dnn_max:.1f} mol%) · "
                 f"{int(keep.sum())} land inside the region (hull of the selected glasses in the {len(region)} lassoed panel(s))")
         if not keep.any():
             return None, None, None, info + " — try a larger selection or more mixtures", region
-        C, Z, i, p2, p3, W = C[keep], Z[keep], i[keep], p2[keep], p3[keep], W[keep]
-
-        gen = self.describe(C, Z)
-        gen["type"] = np.where(p3 >= 0, "triplet", np.where(np.isin(p2, pool), "pair (region)", "pair"))
-        gen["parents"] = [" + ".join(f"{w:.2f}·{self.ids[q]}" for q, w in zip(qs, ws) if q >= 0)
-                          for qs, ws in zip(np.c_[i, p2, p3], W)]
-        gen["family"] = families(100 * C, -gen["emptiness"].to_numpy(), self.args.family_radius)
-        return gen, C, Z, info, region
+        C, Z = C[keep], Z[keep]
+        return self.candidates(pool, C, Z, i[keep], p2[keep], p3[keep], W[keep]), C, Z, info, region
 
 
 # ---------------------------------------------------------------------------- selection geometry

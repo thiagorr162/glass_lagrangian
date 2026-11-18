@@ -13,6 +13,8 @@ glasses that fill those holes.
 | 3 | `src/train_ri_model.py` | Trains a refractive-index regressor (gradient boosting on composition) and reports 5-fold CV error. | ~30 s |
 | 4 | `src/compare_ri_interpolation.py` | Compares the regressor with interpolating RI from neighboring glasses. | ~2 min |
 | 5 | `src/app.py` | Dash explorer: select a region, generate candidates, inspect, export. | ~5 s to start |
+| — | `src/spectral_embedding_ri.py` | Variant of step 1 whose affinity also has an RI factor `exp(−(n_i − n_j)² / 2σ_n²)`. Tag `m10000_s1_ri1`; open it with `--tag m10000_s1_ri1` in either app. | ~1.5 min |
+| — | `src/app_3d.py` | 3D explorer: a grid of small 3D panels, one per triple φᵢ × φⱼ × φₖ (all 10 by default, selectable). Box selection over φ₁…φ₅ (one slider each, or click a point in any panel), 3D hulls of the parents. Port 8051. | ~5 s to start |
 | — | `src/families_vs_eigenfunctions.py` | Tests how well the eigenfunctions separate glass families (dominant network former). | ~1 min |
 | — | `src/holes.py` | Hole scores (emptiness, enclosure), used by the app; as a script, prints reference distributions. | ~10 s |
 | — | `src/check_candidates.py` | Compares candidates with the database (system, known range, families), used by the app; as a script, checks an exported CSV. | ~3 s |
