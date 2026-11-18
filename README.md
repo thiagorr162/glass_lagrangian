@@ -16,6 +16,7 @@ glasses that fill those holes.
 | — | `src/families_vs_eigenfunctions.py` | Tests how well the eigenfunctions separate glass families (dominant network former). | ~1 min |
 | — | `src/holes.py` | Hole scores (emptiness, enclosure), used by the app; as a script, prints reference distributions. | ~10 s |
 | — | `src/check_candidates.py` | Compares candidates with the database (system, known range, families), used by the app; as a script, checks an exported CSV. | ~3 s |
+| — | `src/ri_spectral_decomposition.py` | How much of RI is a linear combination of the first k eigenfunctions (k up to 200), for the composition-only and the RI-aware kernel. | ~5 min |
 | — | `src/mixture_cloud.py` | Earlier approach: 300k mixtures precomputed over the whole map. Not used by the app anymore. | ~2 min |
 
 ## Setup
@@ -74,6 +75,24 @@ fractions.
 **Why not a kNN graph with local bandwidths?** A first attempt used self-tuning σ_i, the distance to the 7th
 neighbor. In dense series of near-identical compositions σ_i → 0, edge weights underflowed (min ≈ 1e-199) and the
 eigenvectors localized on clusters of 9–24 points.
+
+### Optional RI-aware kernel
+
+`spectral_embedding.py --ri-scale 2` multiplies the affinity by an RI factor:
+
+```
+A_ij = exp(−‖x_i − x_j‖² / 2σ²) · exp(−(RI_i − RI_j)² / 2τ²),    τ = ri_scale · median |RI_i − RI_j|
+```
+
+Two glasses are then neighbors only if both their composition and their RI are close. The model is saved with the
+tag `m10000_s1_ri2`, and the app uses it with `--tag m10000_s1_ri2`.
+
+- RI is clipped to its p1–p99 range (1.47–2.30) before entering the kernel. Outliers would otherwise be isolated,
+  and the eigenvectors would localize on them.
+- `--ri-scale 2` (τ ≈ 0.34) keeps the eigenvectors spread. 1 localizes them; 4 or more is almost the
+  composition-only map.
+- New compositions have no measured RI, so they are placed with their kNN-interpolated RI. Anything measured on
+  this map about RI is partly circular.
 
 ### What the eigenfunctions mean
 
@@ -171,6 +190,26 @@ series at 2.3–2.65); they are kept, on the assumption that they average out.
    - Each is plotted as a red dot in every panel.
    - The composition table shows the same columns for them.
    - **Clear** removes them.
+
+6. **Edit mode** (checkbox, with the number of solutions): see where a region of one panel goes in the others.
+   - **Lasso/box a region** of a panel. It is filled with compositions that land inside it, colored by their
+     position in it: hue from left to right, dark to light from bottom to top. The same colors in the other
+     panels show where each part of the region goes, including its empty parts.
+   - **Click a spot**, including empty space, to see the compositions that land on it.
+   - Real glasses turn gray while edit mode is on, so the colors can be read.
+   - A spot in one panel fixes only 2 of the 5 coordinates. Its "equivalent" in the other panels is therefore a
+     set of compositions, and the message reports their spread in the other eigenfunctions.
+   - Each solution is a convex mixture of 5 real glasses near the spot in that panel: a seed, its 2 nearest
+     glasses in composition, and 2 random ones. The weights are fitted by damped Gauss–Newton on the simplex,
+     using the analytic gradient of the Nyström map, until the mixture lands on the spot.
+   - Click solutions are magenta, region solutions take the region's colors. Dark gray: farther than 7.3 mol% from
+     every real glass, so implausible. Solutions that are a real glass
+     themselves are labelled in the `type` column.
+   - Spots far from every real glass in that panel are reported as unreachable. The Nyström map is a weighted
+     average over the landmarks, so it cannot reach far outside the data.
+   - In edit mode a lasso does not filter. The results replace the candidates in the table, sorted by `d_nn`, and
+     can be exported.
+   - The click is caught by `src/assets/edit_click.js`, because Plotly only fires click events on points.
 
 All panels are subplots of one figure. Ten separate WebGL figures exceed the browser's WebGL context limit, and the
 oldest panels go blank.

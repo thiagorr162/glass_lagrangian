@@ -26,6 +26,18 @@ Generate candidates (button)
   The composition column is the full composition normalized to 100, in the format of the composition box
   (click the cell, Ctrl+C, paste). "Export CSV" writes all of them.
 
+Edit mode (checkbox): click ANYWHERE on a panel (src/assets/edit_click.js catches clicks on empty space too),
+or lasso/box a region, and get compositions that land there; they are drawn in every panel. A spot of one panel
+fixes only 2 of the 5 coordinates, so its "equivalent" in the other panels is a set of compositions, not a point:
+each solution is a convex mixture of 5 real glasses near the spot in that panel, with weights fitted (damped
+Gauss-Newton on the simplex, analytic gradient of the Nystrom map) so that it lands exactly on the spot (within
+0.03 standardized units). A drawn region is filled with solutions colored by their position in it (hue: left ->
+right, lightness: bottom -> top), so the same colors in the other panels show where each part of the region goes.
+Clicks: magenta. Dark gray: farther than --dnn-max from every real glass (implausible). Real glasses turn gray. Spots far from
+every real glass in that panel are unreachable (the Nystrom map is a weighted average of the landmarks). In edit
+mode a lasso does not filter: the selection store is unchanged. The results replace the candidates in the table
+(sorted by d_nn) and can be exported the same way.
+
 "show candidates" hides/shows the generated candidates on the panels.
 "color by" colors the real glasses by RI, by each network former alone (mol%), by network formers (SiO2 P2O5 B2O3 GeO2 TeO2, mol%) or by
 intermediates (ZrO2 Al2O3 Ta2O5 La2O3 Ga2O3 TiO2 Nb2O5 PbO WO3 Sb2O3 Bi2O3 As2O3 MoO3 V2O5 ..., mol%); both sums are
@@ -36,6 +48,9 @@ Query compositions: type compositions, one per line ("TeO2 75 PbO 25", "75TeO2-2
 they are marked with a red dot in every panel, with their status and RI.
 "Clear" removes them.
 
+
+With a model fitted with the RI kernel (spectral_embedding.py --ri-scale ..., e.g. --tag m10000_s1_ri1), new
+compositions are placed using their kNN-interpolated RI.
 
 Run from the project root (needs outputs of spectral_embedding.py and train_ri_model.py):
   uv run src/app.py
@@ -57,6 +72,7 @@ from dash import ALL, Dash, Input, Output, Patch, State, ctx, dash_table, dcc, h
 from matplotlib.path import Path as MplPath
 from scipy.spatial import ConvexHull
 from plotly.subplots import make_subplots
+from sklearn.metrics.pairwise import euclidean_distances
 from sklearn.neighbors import KNeighborsRegressor, NearestNeighbors
 
 sys.path.insert(0, str(Path("src")))
@@ -129,10 +145,15 @@ class Context:
         self.inter_idx = [idx[o.lower()] for o in INTERMEDIATES if o.lower() in idx]
         self.formers = 100 * self.X[:, self.former_idx].sum(axis=1)
         self.intermediates = 100 * self.X[:, self.inter_idx].sum(axis=1)
-
+        # Nystrom weights of phi1..phi5: phi(x) = p(x) @ W, p = kernel row normalized to 1 (see transform)
+        se = self.se
+        self.W = se.V_[:, 1:N_PHI + 1] / np.sqrt(se.d_)[:, None] / se.mu_[1:N_PHI + 1][None, :]
+        self._panel_nn = {}
 
     def embed(self, C: np.ndarray) -> np.ndarray:
-        return (self.se.transform(C)[:, :N_PHI] - self.mu) / self.sd
+        # with the property-aware kernel the RI of a new composition is unknown: use the kNN-interpolated RI
+        y = self.ri_knn.predict(C) if self.se.uses_ri else None
+        return (self.se.transform(C, y)[:, :N_PHI] - self.mu) / self.sd
 
     def describe(self, C: np.ndarray, Z: np.ndarray) -> pd.DataFrame:
         """Composition fractions C and their map coordinates Z -> everything shown in the tables."""
@@ -194,6 +215,88 @@ class Context:
         gen["family"] = families(100 * C, -gen["emptiness"].to_numpy(), self.args.family_radius)
         return gen, C, Z, info, region
 
+    # ------------------------------------------------------------ edit mode: compositions that land on a spot
+    def phi_and_jacobian(self, x: np.ndarray, cols: list[int]):
+        """Standardized phi_cols(x) and its gradient w.r.t. the composition x (B x len(cols) x n_oxides).
+
+        phi(x) = sum_l p_l(x) W_l with p_l = K_l / sum K, K_l = exp(-|x - x_l|^2 / 2 sigma^2), so
+        d phi / dx = (1/sigma^2) sum_l p_l W_l (x_l - xbar),  xbar = sum_l p_l x_l  (a p-weighted covariance).
+        With the RI kernel the RI factor is held fixed at the interpolated RI of x (its gradient is ignored)."""
+        se = self.se
+        dist2 = euclidean_distances(x, se.X_, squared=True)
+        Kx = np.exp(-dist2 / (2 * se.sigma_**2))
+        if se.uses_ri:
+            Kx *= se._ri_factor(np.clip(self.ri_knn.predict(x), se.y_lo_, se.y_hi_), se.y_)
+        Kx[dist2 < 1e-12] = 0.0
+        p = Kx / Kx.sum(axis=1, keepdims=True)
+        Wc = self.W[:, cols]
+        phi = p @ Wc
+        xbar = p @ se.X_
+        J = np.stack([(p * Wc[:, c]) @ se.X_ - phi[:, c:c + 1] * xbar for c in range(len(cols))], axis=1)
+        sd = self.sd[cols]
+        return (phi - self.mu[cols]) / sd, J / se.sigma_**2 / sd[None, :, None]
+
+    def preimage(self, i: int, j: int, T: np.ndarray, per_target: int, seed: int = 0, n_iter: int = 40,
+                 pool_size: int = 200, n_seed: int = 50):
+        """Compositions whose Nystrom coordinates (phi_i, phi_j) equal each target in T (standardized units).
+
+        A point of one panel fixes 2 of the 5 coordinates, so its "equivalent" in the other panels is a whole set
+        of compositions. Each solution is a convex mixture (always a valid composition) of 5 anchor glasses:
+        a seed among the 50 real glasses nearest to the target IN THAT PANEL, its 2 nearest glasses in composition
+        and 2 random glasses, both among the 200 nearest in that panel. Different seeds give different
+        solutions. The mixture weights are fitted by damped Gauss-Newton on the simplex until the mixture lands on
+        the target."""
+        rng = np.random.default_rng(seed)
+        cols = [i - 1, j - 1]
+        if (i, j) not in self._panel_nn:
+            self._panel_nn[(i, j)] = NearestNeighbors().fit(self.R[:, cols])
+        B = len(T) * per_target
+        rows = np.arange(B)
+        tgt = np.repeat(T, per_target, axis=0)
+        pool = self._panel_nn[(i, j)].kneighbors(T, n_neighbors=pool_size, return_distance=False)
+        pool = np.repeat(pool, per_target, axis=0)
+        seed_g = pool[rows, rng.integers(n_seed, size=B)]
+        d = np.linalg.norm(self.X[pool] - self.X[seed_g][:, None, :], axis=2)
+        d[d < 0.005] = np.inf  # skip the seed itself and its near-duplicates (they add no direction)
+        near = pool[rows[:, None], np.argsort(d, axis=1)[:, :2]]
+        rand = pool[rows[:, None], rng.integers(pool_size, size=(B, 2))]
+        A = np.c_[seed_g, near, rand]
+        CA = self.X[A]  # B x 5 anchors x oxides
+        w = rng.dirichlet(np.ones(A.shape[1]), size=B)
+        eye = np.eye(2)
+        act = rows  # solutions still moving
+        best = np.full(B, np.inf)
+        best_w = w.copy()
+        stall = np.zeros(B, int)
+        for _ in range(n_iter):
+            z, J = self.phi_and_jacobian(np.einsum("ba,bad->bd", w[act], CA[act]), cols)
+            r = tgt[act] - z
+            res = np.linalg.norm(r, axis=1)
+            better = res < 0.99 * best[act]
+            best_w[act[better]] = w[act[better]]
+            best[act[better]] = res[better]
+            stall[act] = np.where(better, 0, stall[act] + 1)
+            # stop a solution once it is on target, or after 5 steps without progress (target out of reach)
+            moving = (res > 1e-3) & (stall[act] < 5)
+            act, r, J = act[moving], r[moving], J[moving]
+            if len(act) == 0:
+                break
+            Jw = np.einsum("bkd,bad->bka", J, CA[act])
+            Jw -= Jw.mean(axis=2, keepdims=True)  # moves that keep sum(w) = 1
+            G = Jw @ Jw.transpose(0, 2, 1)
+            G += (1e-9 + 1e-3 * np.trace(G, axis1=1, axis2=2))[:, None, None] * eye
+            step = np.einsum("bka,bk->ba", Jw, np.linalg.solve(G, r[..., None])[..., 0])
+            step *= np.minimum(1.0, 0.5 / np.maximum(np.abs(step).max(axis=1, keepdims=True), 1e-12))
+            w[act] = project_simplex(w[act] + step)
+        z, _ = self.phi_and_jacobian(np.einsum("ba,bad->bd", w, CA), cols)  # keep the last step if it was best
+        last_better = np.linalg.norm(tgt - z, axis=1) < best
+        best_w[last_better] = w[last_better]
+        w = best_w
+        C = np.einsum("ba,bad->bd", w, CA)
+        Z = self.embed(C)  # exact placement (all 5 coordinates)
+        resid = np.linalg.norm(Z[:, cols] - tgt, axis=1)
+        return C, Z, resid, A, w
+
 
 # ---------------------------------------------------------------------------- selection geometry
 def geometry(sel: dict | None) -> tuple[str, dict] | None:
@@ -243,8 +346,53 @@ def hull_region(P: np.ndarray, panels) -> dict:
     return region
 
 
+def project_simplex(V: np.ndarray) -> np.ndarray:
+    """Euclidean projection of each row onto the probability simplex."""
+    U = -np.sort(-V, axis=1)
+    css = np.cumsum(U, axis=1) - 1
+    k = np.arange(1, V.shape[1] + 1)
+    rho = (U - css / k > 0).sum(axis=1)
+    theta = css[np.arange(len(V)), rho - 1] / rho
+    return np.maximum(V - theta[:, None], 0.0)
+
+
+def sample_inside(geom: dict, n: int, rng: np.random.Generator) -> np.ndarray:
+    """n points uniformly inside a lasso/box geometry (rejection sampling in its bounding box)."""
+    xs, ys = ((geom["lassoPoints"]["x"], geom["lassoPoints"]["y"]) if "lassoPoints" in geom
+              else (geom["range"]["x"], geom["range"]["y"]))
+    lo, hi = np.array([min(xs), min(ys)]), np.array([max(xs), max(ys)])
+    out = np.zeros((0, 2))
+    for _ in range(50):
+        P = lo + (hi - lo) * rng.random((4 * n, 2))
+        out = np.r_[out, P[inside(geom, P[:, 0], P[:, 1])]]
+        if len(out) >= n:
+            break
+    return out[:n]
+
+
 OUTLINE_STYLE = {"selection": dict(color="#222", width=1.5, dash="dot"),
-                 "hull": dict(color="#1f77b4", width=1.5, dash="dash")}
+                 "hull": dict(color="#1f77b4", width=1.5, dash="dash"),
+                 "edit": dict(color="#d6008f", width=2, dash="solid")}
+EDIT_COLOR, EDIT_FAR_COLOR = "#d6008f", "#7a7a7a"
+EDIT_BG_COLOR = "#d9d9d9"  # real glasses while in edit mode  # edit-mode solutions: plausible / far from every real glass
+
+
+def region_colors(P: np.ndarray, geom: dict) -> np.ndarray:
+    """2D color map over the bounding box of a region: hue from x (left -> right), lightness from y."""
+    import colorsys
+    xs, ys = ((geom["lassoPoints"]["x"], geom["lassoPoints"]["y"]) if "lassoPoints" in geom
+              else (geom["range"]["x"], geom["range"]["y"]))
+    u = (P[:, 0] - min(xs)) / max(max(xs) - min(xs), 1e-12)
+    v = (P[:, 1] - min(ys)) / max(max(ys) - min(ys), 1e-12)
+    rgb = [colorsys.hls_to_rgb(0.8 * a, 0.25 + 0.45 * b, 0.9) for a, b in zip(np.clip(u, 0, 1), np.clip(v, 0, 1))]
+    return np.array(["#%02x%02x%02x" % tuple(int(255 * c) for c in col) for col in rgb])
+
+
+def target_marker(n: int, x: float, y: float) -> dict:
+    """Ring of fixed pixel size around a clicked spot of panel n."""
+    xr, yr = axis_ids(n)
+    return dict(type="circle", xref=xr, yref=yr, xsizemode="pixel", ysizemode="pixel", xanchor=x, yanchor=y,
+                x0=-9, x1=9, y0=-9, y1=9, line=OUTLINE_STYLE["edit"], fillcolor="rgba(0,0,0,0)")
 
 
 def outline(geom: dict, n: int, kind: str = "selection") -> dict:
@@ -294,7 +442,7 @@ def make_grid(K: Context) -> go.Figure:
             hovertemplate="real · RI=%{customdata[0]:.4f} · formers %{customdata[1]:.1f}% · "
                           "intermediates %{customdata[2]:.1f}%<extra></extra>"), **kw)
         fig.add_trace(go.Scattergl(x=[], y=[], mode="markers", name="generated",
-                                   marker=dict(size=4, symbol="diamond"),
+                                   marker=dict(size=5, symbol="diamond"),
                                    unselected=dict(marker=dict(opacity=1)),
                                    hovertemplate="%{hovertext}<extra></extra>"), **kw)
         # WebGL like the other traces: SVG traces are drawn UNDER the WebGL canvas. Last trace = on top.
@@ -380,7 +528,8 @@ def filtered(gen: pd.DataFrame, opts: list) -> pd.DataFrame:
 
 def build_app(K: Context) -> Dash:
     args = K.args
-    app = Dash(__name__, title="Glass spectral explorer")
+    # src/assets/edit_click.js: in edit mode, a click anywhere in a panel (not only on a point) is sent here
+    app = Dash(__name__, title="Glass spectral explorer", assets_folder=str(Path("src/assets").resolve()))
     app.layout = html.Div(style={"fontFamily": "system-ui, sans-serif", "padding": "8px 16px"}, children=[
         html.Div(style={"display": "flex", "alignItems": "center", "gap": "14px", "flexWrap": "wrap"}, children=[
             html.H3("Glass spectral explorer", style={"margin": "4px 0"}),
@@ -400,8 +549,22 @@ def build_app(K: Context) -> Dash:
                       style={"fontSize": "13px"}),
             dcc.Checklist(id="show-gen", options=[{"label": " show candidates", "value": "on"}],
                           value=["on"], inline=True),
+            html.Span(style={"fontSize": "13px", "padding": "2px 8px", "border": f"1px solid {EDIT_COLOR}",
+                             "borderRadius": "6px"}, children=[
+                dcc.Checklist(id="edit-mode", options=[{"label": " edit mode", "value": "on"}], value=[],
+                              inline=True, style={"display": "inline-block", "fontWeight": "600",
+                                                  "color": EDIT_COLOR}),
+                " solutions: ", dcc.Input(id="edit-n", type="number", value=600, min=10, max=2000, step=50,
+                                          style={"width": "60px"})]),
             html.Span(id="export-msg", style={"color": "#555"}),
         ]),
+        html.Div(["Edit mode: lasso/box a region of a panel to see where it goes in the other panels (it is "
+                  "filled with compositions that land inside it, colored by their position in it), or click a "
+                  "single spot. Click: ",
+                  legend_dot(EDIT_COLOR, f"within {100 * args.dnn_max:.1f} mol% of a real glass"),
+                  legend_dot(EDIT_FAR_COLOR, "farther (implausible)"),
+                  "· the table lists them (most plausible first)."],
+                 id="edit-help", style={"display": "none"}),
         html.Div(["Select a region (lasso/box; panels combine by intersection), then Generate. Candidates: ",
                   *[legend_dot(STATUS_COLOR[s], s) for s in STATUSES],
                   "· click a composition cell and Ctrl+C to copy it into the composition box."],
@@ -437,30 +600,36 @@ def build_app(K: Context) -> Dash:
             style_data_conditional=FLAG_STYLE),
         dcc.Store(id="sel-store", data={}),
         dcc.Store(id="gen-version", data=0),
+        dcc.Store(id="edit-click"),   # written by src/assets/edit_click.js
+        dcc.Store(id="edit-region"),  # a lasso/box drawn in edit mode
     ])
 
     # ---- selection
     @app.callback(
         Output("grid", "figure"), Output("sel-store", "data"), Output("summary", "children"),
-        Output("active-bar", "children"),
+        Output("active-bar", "children"), Output("edit-region", "data"),
         Input("grid", "selectedData"), Input("clear", "n_clicks"), Input({"type": "rm", "key": ALL}, "n_clicks"),
-        State("sel-store", "data"), prevent_initial_call=True)
-    def on_select(_sel, _clicks, _rm_clicks, store):
+        State("sel-store", "data"), State("edit-mode", "value"), prevent_initial_call=True)
+    def on_select(_sel, _clicks, _rm_clicks, store, edit_mode):
         store = dict(store or {})
         trig = ctx.triggered_id
         value = ctx.triggered[0]["value"] if ctx.triggered else None
+        edit_region = no_update
         if trig == "clear":
             store = {}
         elif isinstance(trig, dict) and trig.get("type") == "rm":
             if not value:  # fired because the button was just created, not clicked
-                return (no_update,) * 4
+                return (no_update,) * 5
             store.pop(trig["key"], None)
         else:
             parsed = geometry(value)
             if parsed is None:  # deselect events also fire when we clear plotly's native selection: ignore
-                return (no_update,) * 4
+                return (no_update,) * 5
             key, geom = parsed
-            store[key] = geom
+            if edit_mode:  # the lasso is a region to fill with solutions, not a filter: the store is unchanged
+                edit_region = {"key": key, "geom": geom, "t": datetime.now().timestamp()}
+            else:
+                store[key] = geom
 
         # the store is the single source of truth: clear plotly's native selection, redraw outlines
         r_in = points_inside(store, K.R)
@@ -477,25 +646,31 @@ def build_app(K: Context) -> Dash:
                                "border": "1px solid #999", "background": "white", "cursor": "pointer"})
             for k in store] if store else []
         if not store:
-            return patch, store, "No selection.", bar
+            return patch, store, "No selection.", bar, edit_region
         ri_sel = K.ri[r_in]
         ri_txt = (f"RI {np.median(ri_sel):.3f} (median), {np.percentile(ri_sel, 5):.3f}–"
                   f"{np.percentile(ri_sel, 95):.3f} (p5–p95)" if len(ri_sel) else "empty region")
         summary = html.Div([html.B(f"Intersection of {len(store)} selection(s): {int(r_in.sum())} real glasses"),
                             f" · {ri_txt}"])
-        return patch, store, summary, bar
+        return patch, store, summary, bar, edit_region
 
     # ---- color the real glasses by RI / network formers / intermediates
     @app.callback(Output("grid", "figure", allow_duplicate=True), Input("color-by", "value"),
-                  prevent_initial_call=True)
-    def on_color_by(key):
+                  Input("edit-mode", "value"), prevent_initial_call=True)
+    def on_color_by(key, edit_mode):
+        patch = Patch()
+        if edit_mode:  # gray background, so the colors of the edit-mode solutions can be read
+            for n in range(len(PAIRS)):
+                patch["data"][trace_index(n, REAL_TRACE)]["marker"]["color"] = EDIT_BG_COLOR
+            patch["data"][trace_index(0, REAL_TRACE)]["marker"]["showscale"] = False
+            return patch
+        patch["data"][trace_index(0, REAL_TRACE)]["marker"]["showscale"] = True
         if key.startswith("ox:"):  # a single oxide, mol%
             values = 100 * K.X[:, list(K.oxides).index(key[3:])]
         else:
             values = {"ri": K.ri, "formers": K.formers, "intermediates": K.intermediates}[key]
         lo, hi = (np.percentile(values, [1, 99]) if key == "ri" else (0.0, float(values.max())))
         colors = np.round(np.clip(values, lo, hi), 3).tolist()  # rounded: smaller payload (58k values x 10 panels)
-        patch = Patch()
         for n in range(len(PAIRS)):
             m = patch["data"][trace_index(n, REAL_TRACE)]["marker"]
             m["color"] = colors
@@ -544,6 +719,7 @@ def build_app(K: Context) -> Dash:
             GEN.clear()
             marker_patch(patch, GEN_TRACE, np.zeros((0, N_PHI)), [], color=[])
             return patch, info, (version or 0) + 1
+        GEN.clear()
         GEN.update(df=gen, C=C, Z=Z)
         hover = [f"{c} · RI≈{r:.3f} · {s} · emptiness {e:.1f}" for c, r, s, e in
                  zip(gen["composition"], gen["ri_interp"], gen["status"], gen["emptiness"])]
@@ -561,10 +737,94 @@ def build_app(K: Context) -> Dash:
         gen = filtered(GEN["df"], opts or [])
         if gen.empty:
             return []
-        reps = gen.sort_values("emptiness", ascending=False).drop_duplicates("family")
+        by, asc = GEN.get("sort", ("emptiness", False))  # edit mode: most plausible (smallest d_nn) first
+        reps = gen.sort_values(by, ascending=asc).drop_duplicates("family")
         reps = reps.assign(n=reps["family"].map(gen["family"].value_counts()).to_numpy()).head(500)
         reps = reps.assign(rank=np.arange(1, len(reps) + 1))
         return reps[[c for c, _ in TABLE_COLS]].round(ROUND).to_dict("records")
+
+    # ---- edit mode: compositions that land on a clicked spot / inside a drawn region
+    @app.callback(Output("edit-help", "style"), Input("edit-mode", "value"))
+    def on_edit_mode(mode):
+        return ({"color": "#555", "fontSize": "13px", "marginBottom": "4px", "padding": "4px 8px",
+                 "background": "#fdf0f8", "borderRadius": "6px"} if mode else {"display": "none"})
+
+    @app.callback(Output("grid", "figure", allow_duplicate=True),
+                  Output("gen-msg", "children", allow_duplicate=True),
+                  Output("gen-version", "data", allow_duplicate=True), Output("table-opts", "value"),
+                  Output("show-gen", "value", allow_duplicate=True),
+                  Input("edit-click", "data"), Input("edit-region", "data"),
+                  State("edit-mode", "value"), State("edit-n", "value"), State("gen-version", "data"),
+                  State("sel-store", "data"), prevent_initial_call=True)
+    def on_edit(click, region, mode, n_sol, version, store):
+        if not mode:
+            return (no_update,) * 5
+        n_sol = int(n_sol or 300)
+        rng = np.random.default_rng(int(version or 0))
+        shapes = [outline(store[f"{i}-{j}"], n) for n, (i, j) in enumerate(PAIRS) if f"{i}-{j}" in (store or {})]
+        if ctx.triggered_id == "edit-click":
+            if not click:
+                return (no_update,) * 5
+            panel = 0 if click["xaxis"] == "x" else int(click["xaxis"][1:]) - 1
+            T = np.array([[click["x"], click["y"]]])
+            per_target = n_sol
+            shapes.append(target_marker(panel, click["x"], click["y"]))
+            where = f"the spot ({click['x']:.2f}, {click['y']:.2f})"
+            kind = "click"
+        else:
+            if not region:
+                return (no_update,) * 5
+            i0, j0 = map(int, region["key"].split("-"))
+            panel = PAIRS.index((i0, j0))
+            per_target = 2
+            T = sample_inside(region["geom"], max(1, n_sol // per_target), rng)
+            if len(T) == 0:
+                return no_update, "edit mode: the drawn region is empty", no_update, no_update, no_update
+            shapes.append(outline(region["geom"], panel, "edit"))
+            where = f"{len(T)} spots spread over the drawn region"
+            kind = "region"
+        i, j = PAIRS[panel]
+        C, Z, resid, A, w = K.preimage(i, j, T, per_target, seed=int(version or 0))
+        tol = 0.03  # standardized units (~0.5% of a panel's width)
+        hit = resid <= tol
+        patch = Patch()
+        patch["layout"]["shapes"] = shapes
+        head = f"edit mode · φ{i} × φ{j} · {where} · {len(C)} mixtures fitted · {int(hit.sum())} land on target"
+        if not hit.any():
+            GEN.clear()
+            marker_patch(patch, GEN_TRACE, np.zeros((0, N_PHI)), [], color=[])
+            return (patch, head + " — unreachable: too far from every real glass in this panel",
+                    (version or 0) + 1, [], no_update)
+        C, Z, A, w = C[hit], Z[hit], A[hit], w[hit]
+        src = np.repeat(T, per_target, axis=0)[hit]  # where each solution sits in the drawn panel
+        gen = K.describe(C, Z)
+        gen["type"] = np.where(gen["d_nn_pct"] < 0.1, f"edit {kind} φ{i}×φ{j} (= a real glass)",
+                               f"edit {kind} φ{i}×φ{j}")
+        gen["parents"] = [" + ".join(f"{wk:.2f}·{K.ids[q]}" for q, wk in zip(qs, ws) if wk >= 0.005)
+                          for qs, ws in zip(A, w)]
+        gen["family"] = families(100 * C, gen["d_nn_pct"].to_numpy(), args.family_radius)
+        GEN.clear()
+        GEN.update(df=gen, C=C, Z=Z, sort=("d_nn_pct", True))
+        near = gen["d_nn_pct"].to_numpy() <= 100 * args.dnn_max
+        hover = [f"{c} · RI≈{r:.3f} · {s} · d_nn {d:.1f} mol%" for c, r, s, d in
+                 zip(gen["composition"], gen["ri_interp"], gen["status"], gen["d_nn_pct"])]
+        if kind == "region":  # color = position inside the drawn region, carried to every other panel
+            colors = np.where(near, region_colors(src, region["geom"]), EDIT_FAR_COLOR)
+        else:
+            colors = np.where(near, EDIT_COLOR, EDIT_FAR_COLOR)
+        marker_patch(patch, GEN_TRACE, Z, hover, color=colors.tolist())
+        others = [k for k in range(N_PHI) if k not in (i - 1, j - 1)]
+        spread = ", ".join(f"φ{k + 1} {np.percentile(Z[near, k], 5):.2f}…{np.percentile(Z[near, k], 95):.2f}"
+                           for k in others) if near.sum() >= 2 else "—"
+        msg = [head, html.Br(),
+               html.B(f"{int(near.sum())} plausible (d_nn ≤ {100 * args.dnn_max:.1f} mol%) in "
+                      f"{gen.loc[near, 'family'].nunique()} families"),
+               f" · {int((~near).sum())} farther (gray) · spread in the other eigenfunctions (p5…p95): {spread}"]
+        if kind == "region":
+            msg += [html.Br(), f"Color = position inside the drawn region of φ{i} × φ{j} (left → right: hue, "
+                               "bottom → top: dark → light). The same colors in the other panels show where each "
+                               "part of the region goes."]
+        return patch, msg, (version or 0) + 1, [], ["on"]
 
     # ---- typed compositions
     @app.callback(Output("grid", "figure", allow_duplicate=True), Output("query-table", "data"),
