@@ -43,7 +43,7 @@ The units were checked on PbO–SiO₂ glasses. Their RI versus PbO content matc
 ### Run
 
 ```bash
-uv run src/spectral_embedding.py        # options: --m 10000 --sigma-scale 1.0 --n-components 10
+uv run src/spectral_embedding.py        # options: --m 10000 --sigma-scale 1.0 --n-components 10 --alpha 0
 uv run src/validate_nystrom.py --k 5
 uv run src/train_ri_model.py
 uv run src/compare_ri_interpolation.py
@@ -91,6 +91,20 @@ out to be contrasts between families, as expected from spectral clustering:
 
 The family (silicate, borate, phosphate, germanate, tellurite, or non-conventional if formers < 20 mol%) is
 recovered from φ₁…φ₅ alone with 99.0% 5-fold kNN accuracy (95.4% from φ₁, φ₂; majority baseline 45.6%).
+
+### α-normalization (`--alpha`)
+
+Both embedding scripts take `--alpha` (Coifman–Lafon). With the density estimate `q_i = Σ_j A_ij`, the kernel is
+reweighted to `A_ij / (q_i q_j)^α` before the normalization above. In the small-σ limit the random walk's generator is
+`Δf + 2(1 − α) ∇log p · ∇f`, with `p` the sampling density:
+
+- α = 0 (default, all results above): density shapes the map; dense regions are compressed, sparse ones stretched.
+- α = 1: geometry only (Laplace–Beltrami).
+
+On the RI-weighted map this matters. With α = 0, glasses with RI > 2.1 (4.6% of the data) cover 63% of the visible
+area of φ₁ × φ₂, because few glasses share their RI. With α = 1 they cover 36%, about their share of the RI range;
+φ₁ still follows RI (Spearman 0.99). On the composition-only map α barely changes the picture. A tag gets the
+suffix `_a<α>` when α ≠ 0, e.g. `m10000_s1_ri1_a1`.
 
 ### Nyström extension
 

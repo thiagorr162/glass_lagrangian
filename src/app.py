@@ -119,7 +119,8 @@ class Context:
 
         self.se = load_model(MODELS / f"model_{args.tag}.npz")  # plain, or RI-weighted (spectral_embedding_ri.py)
         self.ri_weighted = isinstance(self.se, RISpectralEmbedding)
-        print(f"model {args.tag}: {'RI-weighted' if self.ri_weighted else 'composition-only'} kernel")
+        print(f"model {args.tag}: {'RI-weighted' if self.ri_weighted else 'composition-only'} kernel, "
+              f"alpha = {self.se.alpha:g}")
         print("composition neighbors of real glasses ...")
         self.nn_db = NearestNeighbors(n_neighbors=11).fit(self.X)
         self.nbrs = self.nn_db.kneighbors(self.X, return_distance=False)[:, 1:]

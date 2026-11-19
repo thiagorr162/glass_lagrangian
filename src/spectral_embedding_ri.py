@@ -22,7 +22,10 @@ Same landmarks as spectral_embedding.py for the same --m and --seed, so the two 
 
 Run from the project root:
   uv run src/spectral_embedding_ri.py [--m 10000] [--sigma-scale 1.0] [--ri-sigma-scale 1.0] [--n-components 10]
-Writes the same outputs as spectral_embedding.py, tagged m<m>_s<sigma-scale>_ri<ri-sigma-scale>. Explore with
+                                      [--alpha 0]
+Writes the same outputs as spectral_embedding.py, tagged m<m>_s<sigma-scale>_ri<ri-sigma-scale>[_a<alpha>].
+alpha (see SpectralEmbedding) applies to the density in the lifted (composition, RI) space: alpha = 1 removes the
+effect of how many glasses have each RI, while the RI factor still separates glasses of different RI. Explore with
   uv run src/app.py --tag m10000_s1_ri1        or        uv run src/app_3d.py --tag m10000_s1_ri1
 """
 
@@ -34,7 +37,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from scipy.linalg import eigh
 from sklearn.metrics.pairwise import euclidean_distances
 from tqdm import tqdm
 
@@ -80,22 +82,8 @@ class RISpectralEmbedding(SpectralEmbedding):
         for s in range(0, m, 2000):  # RI factor by row blocks (a full m x m factor would double the memory)
             A[s:s + 2000] *= self.ri_factor(self.ri_[s:s + 2000], self.ri_)
         np.fill_diagonal(A, 0.0)
-        d = A.sum(axis=1)
-        s = 1.0 / np.sqrt(d)
-        M = A * s[:, None] * s[None, :]
-        del A
-        pbar.update()
-        pbar.set_postfix_str("eigh (slowest step)")
-        k = self.n_components + 1
-        mu, V = eigh(M, subset_by_index=[m - k, m - 1])  # largest eigenvalues of M
-        pbar.update()
-        pbar.close()
-        order = np.argsort(-mu)
-        self.mu_, self.V_ = mu[order], V[:, order]
-        self.eigenvalues_ = 1.0 - self.mu_
-        self.d_ = d
-        self.embedding_ = self.V_[:, 1:] * s[:, None]
-        return self
+        # alpha-reweighting with q = density in the lifted (composition, RI) space, normalization, eigenpairs
+        return self._spectral(A, pbar)
 
     def transform(self, X_new: np.ndarray, ri_new: np.ndarray | None = None, chunk: int = 4000,
                   return_density: bool = False):
@@ -103,30 +91,18 @@ class RISpectralEmbedding(SpectralEmbedding):
         if ri_new is None:
             raise ValueError("the RI-weighted embedding needs the RI of the new compositions (ri_new)")
         ri_new = self.clip_ri(ri_new)
-        W = self.V_[:, 1:] / np.sqrt(self.d_)[:, None] / self.mu_[1:][None, :]
-        out = np.empty((X_new.shape[0], self.n_components))
-        dens = np.empty(X_new.shape[0])
-        for a in tqdm(range(0, X_new.shape[0], chunk), desc=f"Nyström RI (n={X_new.shape[0]})"):
-            dist2 = euclidean_distances(X_new[a:a + chunk], self.X_, squared=True)
-            K = np.exp(-dist2 / (2 * self.sigma_**2)) * self.ri_factor(ri_new[a:a + chunk], self.ri_)
-            K[dist2 < 1e-12] = 0.0  # a landmark does not count itself (A_ii = 0)
-            dx = K.sum(axis=1)
-            out[a:a + chunk] = (K @ W) / dx[:, None]
-            dens[a:a + chunk] = dx
-        return (out, dens) if return_density else out
+        return self._nystrom(X_new, chunk, return_density,
+                             factor=lambda a, b: self.ri_factor(ri_new[a:b], self.ri_))
 
     def save(self, path: Path):
-        np.savez(path, X=self.X_, sigma=self.sigma_, mu=self.mu_, V=self.V_, d=self.d_,
-                 n_components=self.n_components, ri=self.ri_, ri_sigma=self.ri_sigma_, ri_clip=self.ri_clip_)
+        super().save(path, ri=self.ri_, ri_sigma=self.ri_sigma_, ri_clip=self.ri_clip_)
 
     @classmethod
     def load(cls, path: Path) -> "RISpectralEmbedding":
+        se = super().load(path)
         z = np.load(path)
-        se = cls(n_components=int(z["n_components"]), sigma=float(z["sigma"]), ri_sigma=float(z["ri_sigma"]))
-        se.X_, se.sigma_, se.mu_, se.V_, se.d_ = z["X"], float(z["sigma"]), z["mu"], z["V"], z["d"]
+        se.ri_sigma = float(z["ri_sigma"])
         se.ri_, se.ri_sigma_, se.ri_clip_ = z["ri"], float(z["ri_sigma"]), tuple(z["ri_clip"])
-        se.eigenvalues_ = 1.0 - se.mu_
-        se.embedding_ = se.V_[:, 1:] / np.sqrt(se.d_)[:, None]
         return se
 
 
@@ -146,6 +122,9 @@ def main():
     ap.add_argument("--ri-clip-pct", type=float, default=0.5,
                     help="clip RI to [p, 100-p] percentiles in the kernel; 0 = only the [1.3, 3.0] sanity range")
     ap.add_argument("--n-components", type=int, default=10, help="non-trivial eigenvectors to keep")
+    ap.add_argument("--alpha", type=float, default=0.0,
+                    help="Coifman-Lafon normalization: 0 = NJW (default), 1 = remove the sampling density "
+                         "(here: the density in (composition, RI) space, e.g. that few glasses have a high RI)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     ensure_dirs()
@@ -163,8 +142,10 @@ def main():
     is_landmark[land] = True
 
     se = RISpectralEmbedding(sigma_scale=args.sigma_scale, ri_sigma_scale=args.ri_sigma_scale,
-                             ri_clip_pct=args.ri_clip_pct, n_components=args.n_components).fit(X[land], ri[land])
-    print(f"{n} glasses, {len(land)} landmarks, sigma = {se.sigma_:.4f}, sigma_n (RI) = {se.ri_sigma_:.4f}"
+                             ri_clip_pct=args.ri_clip_pct, n_components=args.n_components,
+                             alpha=args.alpha).fit(X[land], ri[land])
+    print(f"{n} glasses, {len(land)} landmarks, alpha = {args.alpha:g}, sigma = {se.sigma_:.4f}, "
+          f"sigma_n (RI) = {se.ri_sigma_:.4f}"
           f"  [exp(-dn^2/s) with s = {2 * se.ri_sigma_**2:.4f}], RI clipped to "
           f"[{se.ri_clip_[0]:.3f}, {se.ri_clip_[1]:.3f}] in the kernel")
     print("smallest eigenvalues of L:", np.round(se.eigenvalues_, 5))
@@ -177,7 +158,7 @@ def main():
 
     emb = se.transform(X, ri)
     emb[land] = se.embedding_  # exact values for landmarks
-    tag = f"m{len(land)}_s{args.sigma_scale:g}_ri{args.ri_sigma_scale:g}"
+    tag = f"m{len(land)}_s{args.sigma_scale:g}_ri{args.ri_sigma_scale:g}" + (f"_a{args.alpha:g}" if args.alpha else "")
     se.save(MODELS / f"model_{tag}.npz")
     np.save(MODELS / f"landmarks_{tag}.npy", land)
 
@@ -192,7 +173,8 @@ def main():
     text = hover_text(ids, comps, ri, is_landmark)
     marker = dict(color=np.clip(ri, cmin, cmax), colorscale="Viridis", cmin=cmin, cmax=cmax,
                   colorbar=dict(title="RI"), opacity=0.8)
-    title = (f"RI-weighted spectral embedding (σ={se.sigma_:.3f}, σ_n={se.ri_sigma_:.3f}) — {len(land)} landmarks, "
+    title = (f"RI-weighted spectral embedding (σ={se.sigma_:.3f}, σ_n={se.ri_sigma_:.3f}, α={args.alpha:g}) — "
+             f"{len(land)} landmarks, "
              f"{n} glasses via Nyström — color = RI (clipped p1–p99)")
 
     fig2 = go.Figure(go.Scattergl(x=emb[:, 0], y=emb[:, 1], mode="markers", text=text, hoverinfo="text",

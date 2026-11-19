@@ -304,7 +304,7 @@ def box_after_click(K: Context3D, box, t, point) -> list[list[float]]:
 def build_app(K: Context3D) -> Dash:
     args = K.args
     full = K.full_box()
-    kernel = "RI-weighted kernel" if K.ri_weighted else "composition kernel"
+    kernel = ("RI-weighted kernel" if K.ri_weighted else "composition kernel") + f", α = {K.se.alpha:g}"
     app = Dash(__name__, title="Glass spectral explorer 3D")
     sliders = [html.Div(style={"display": "flex", "alignItems": "center", "gap": "6px"}, children=[
         html.Span(f"φ{k}", style={"width": "24px", "fontWeight": "600", "fontSize": "13px"}),
